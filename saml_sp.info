@@ -1,0 +1,4 @@
+fname = SAML Service Provider
+description = Hook into the SAML 2.0 authentication services
+core = 7.x
+php = 5.3

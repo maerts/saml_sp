@@ -1,0 +1,194 @@
+<?php
+/**
+ * @file
+ * Drupal Service Provider for SAML
+ *
+ */
+
+include_once(__DIR__ . '/lib/DrupalServiceProvider.php');
+include_once(__DIR__ . '/lib/DrupalServiceProviderException.php');
+
+/**
+ * Implements hook_permission().
+ */
+function saml_sp_permission() {
+  return array(
+    'configure saml sp' => array(
+      'title' => t('Configure SAML'),
+      'description' => t('Configure the SAML Service Provider integration.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function saml_sp_menu() {
+  $items = array();
+
+  $items['admin/config/people/saml_sp'] = array(
+    'title' => 'Configure SAML',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('saml_sp_configuration_form'),
+    'access arguments' => array('configure saml sp'),
+    'file' => 'saml_sp.admin.inc',
+  );
+
+  $items['admin/config/people/saml_sp/configuration'] = array(
+    'title' => 'Configure SAML',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('saml_sp_configuration_form'),
+    'access arguments' => array('configure saml sp'),
+    'file' => 'saml_sp.admin.inc',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items['admin/config/people/saml_sp/mapping'] = array(
+    'title' => 'Mapping',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('saml_sp_user_mapping_form'),
+    'access arguments' => array('configure saml sp'),
+    'file' => 'saml_sp.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['saml/consume'] = array(
+    'title' => 'Configure SAML',
+    'page callback' => '_saml_sp_consume',
+    'access callback' => TRUE,
+  );
+
+  $items['saml/metadata'] = array(
+    'title' => 'SAML metadata',
+    'page callback' => '_saml_sp_metadata',
+    'access callback' => TRUE,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ */
+function saml_sp_form_user_login_alter(&$form, &$form_state) {
+  if (!isset($_GET['nosaml']) || $_GET['nosaml'] != 1) {
+    if (!isset($_SESSION['SAML'])) {
+      try {
+        $config = _saml_sp_config();
+        $dsp = new DrupalServiceProvider($config);
+        $dsp->authenticate();
+      } catch (Exception $e) {
+        watchdog('SAML', 'Configuration error: !emsg', array(
+          '!emsg' => $e->getMessage()
+        ), WATCHDOG_ERROR);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function saml_sp_menu_alter(&$items) {
+  $items['user/%user/edit']['access callback'] = '_saml_sp_access_callback';
+}
+
+/**
+ * Access callback for user edit form.
+ */
+function _saml_sp_access_callback() {
+  // If the session param SAML isset, disallow access.
+  if (!isset($_SESSION['SAML'])) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+
+/**
+ * Helper function to pass the config easily.
+ */
+function _saml_sp_config() {
+  return $sporto_config = array(
+    'idp_certificate' => variable_get('idpcert'),
+    'sso' => variable_get('idpurl'),
+    'private_key' => variable_get('spprivkey'),
+    'public_key' => variable_get('sppubkey'),
+    'asc' => variable_get('acs'),
+    'entityid' => variable_get('eid'),
+  );
+}
+
+/**
+ * Callback for SP redirect.
+ */
+function _saml_sp_consume() {
+  try {
+    $config = _saml_sp_config();
+    $dsp = new DrupalServiceProvider($config);
+    $result = $dsp->authenticate();
+    if (array_key_exists(variable_get('spmap_username'), $result['attributes']) &&
+      array_key_exists(variable_get('spmap_email'), $result['attributes']) &&
+      array_key_exists(variable_get('spmap_role'), $result['attributes'])
+    ) {
+      // Roles lookup & mapping.
+      $roles = array();
+      foreach (user_roles(TRUE) as $key => $hr) {
+        if (in_array(variable_get('spmap_' . $key), $result['attributes'][variable_get('spmap_role')])) {
+          $roles[$key] = $hr;
+        }
+      }
+      // If the user doesn't have any roles, don't log him in.
+      if (count($roles) > 0) {
+        global $user;
+        if ($user = user_load_by_name($result['attributes'][variable_get('spmap_username')][0])) {
+          // Always reset the roles as received from the IDP.
+          user_save($user, array('roles' => $roles));
+        }
+        else {
+          require_once DRUPAL_ROOT . '/' . variable_get('password_inc', 'includes/password.inc');
+          $user = new stdClass();
+          $user->name = $result['attributes'][variable_get('spmap_username')][0];
+          // Create an un-unravelable password.
+          $user->pass = user_hash_password(str_shuffle($result['attributes'][variable_get('spmap_username')][0] . $result['attributes'][variable_get('spmap_email')][0] . uniqid()));
+          $user->mail = $result['attributes'][variable_get('spmap_email')][0];
+          $user->roles = $roles;
+          $user->status = 1;
+          $user->is_new = TRUE;
+          user_save($user);
+        }
+        // Login the user in the global.
+        // We do it this way to use the normal drupal login flow.
+        $form_state['uid'] = $user->uid;
+        user_login_submit(array(), $form_state);
+        // Set the SAML param in the session to prevent access to the user edit form.
+        $_SESSION['SAML'] = TRUE;
+      }
+      else {
+        watchdog('SAML', 'User !user has no permissions for this website.', array('!user' => $result['attributes'][variable_get('spmap_username')]), WATCHDOG_ERROR);
+      }
+    }
+    else {
+      watchdog('SAML', 'attributes: !emsg', array(
+        '!emsg' => serialize($result['attributes']),
+      ), WATCHDOG_ERROR);
+    }
+    // Redirect the user to the frontpage.
+    drupal_goto('<front>');
+  } catch (Exception $e) {
+    watchdog('SAML', 'Configuration error: !emsg', array(
+      '!emsg' => $e->getMessage()
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Page callback for SP metadata.
+ */
+function _saml_sp_metadata() {
+  $config = _saml_sp_config();
+  $dsp = new DrupalServiceProvider($config);
+  header('Content-Type: application/xml');
+  echo $dsp->getMetadata();
+  exit(0);
+}
